@@ -48,10 +48,11 @@ struct EvaluationResultDto<'a> {
 }
 
 fn crack_time_to_f64(value: CrackTimeSeconds) -> f64 {
-    match value {
+    let raw = match value {
         CrackTimeSeconds::Integer(i) => i as f64,
         CrackTimeSeconds::Float(f) => f,
-    }
+    };
+    if raw.is_finite() { raw } else { f64::MAX }
 }
 
 fn to_dto<'a>(entropy: &'a Entropy) -> EvaluationResultDto<'a> {
@@ -105,7 +106,7 @@ fn to_dto<'a>(entropy: &'a Entropy) -> EvaluationResultDto<'a> {
 ///
 /// # Safety
 /// - When `pwd_len > 0`, `pwd_ptr` must be a valid pointer to at least `pwd_len` readable bytes.
-/// - When `inputs_len > 0` and `inputs_ptr` is non-null, `inputs_ptr` must be a valid pointer to at least `inputs_len` readable bytes.
+/// - When `inputs_len > 0`, `inputs_ptr` must be a valid pointer to at least `inputs_len` readable bytes.
 /// - The caller MUST free any non-null returned pointer by calling `zxcvbn_free_string`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zxcvbn_evaluate_json(
@@ -118,7 +119,7 @@ pub unsafe extern "C" fn zxcvbn_evaluate_json(
         if pwd_len > MAX_PASSWORD_BYTES || inputs_len > MAX_INPUTS_BYTES {
             return None;
         }
-        if pwd_len > 0 && pwd_ptr.is_null() {
+        if (pwd_len > 0 && pwd_ptr.is_null()) || (inputs_len > 0 && inputs_ptr.is_null()) {
             return None;
         }
 
@@ -129,12 +130,12 @@ pub unsafe extern "C" fn zxcvbn_evaluate_json(
             str::from_utf8(pwd_bytes).ok()?
         };
 
-        let user_inputs: Vec<&str> = if !inputs_ptr.is_null() && inputs_len > 0 {
+        let user_inputs: Vec<&str> = if inputs_len == 0 {
+            Vec::new()
+        } else {
             let input_bytes = unsafe { slice::from_raw_parts(inputs_ptr, inputs_len) };
             let inputs_str = str::from_utf8(input_bytes).ok()?;
             inputs_str.split('\n').filter(|s| !s.is_empty()).collect()
-        } else {
-            Vec::new()
         };
 
         let entropy = zxcvbn(password, &user_inputs);
@@ -170,27 +171,40 @@ mod tests {
     use super::*;
     use std::ffi::CStr;
 
+    fn eval_ffi_raw(
+        pwd_ptr: *const u8,
+        pwd_len: usize,
+        inputs_ptr: *const u8,
+        inputs_len: usize,
+    ) -> Option<String> {
+        let raw = unsafe { zxcvbn_evaluate_json(pwd_ptr, pwd_len, inputs_ptr, inputs_len) };
+        if raw.is_null() {
+            return None;
+        }
+        let owned = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { zxcvbn_free_string(raw) };
+        Some(owned)
+    }
+
     fn eval_ffi(pwd: &[u8], inputs: Option<&[u8]>) -> Option<String> {
         let (in_ptr, in_len) = match inputs {
             Some(b) => (b.as_ptr(), b.len()),
             None => (ptr::null(), 0),
         };
-        let raw = unsafe { zxcvbn_evaluate_json(pwd.as_ptr(), pwd.len(), in_ptr, in_len) };
-        if raw.is_null() {
-            return None;
-        }
-        let s = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
-        unsafe { zxcvbn_free_string(raw) };
-        Some(s)
+        eval_ffi_raw(pwd.as_ptr(), pwd.len(), in_ptr, in_len)
     }
 
     #[test]
-    fn evaluates_weak_strong_contextual_and_empty_passwords() {
+    fn evaluates_golden_vectors_accurately() {
+        let abc = eval_ffi(b"abc123", None).unwrap();
+        let wombat = eval_ffi(b"womB@t-attAcK monkey", None).unwrap();
         let weak = eval_ffi(b"password", None).unwrap();
         let strong = eval_ffi(b"correct horse battery staple", None).unwrap();
         let contextual = eval_ffi(b"acme2026!", Some(b"acme\n2026")).unwrap();
         let empty = eval_ffi(b"", None).unwrap();
 
+        assert!(abc.contains(r#""score":0"#), "abc123: {abc}");
+        assert!(wombat.contains(r#""score":4"#), "wombat: {wombat}");
         assert!(weak.contains(r#""score":0"#));
         assert!(weak.contains(r#""warning":"This is a top-10 common password.""#));
         assert!(weak.contains(r#""warning_code":"ThisIsATop10Password""#));
@@ -198,20 +212,89 @@ mod tests {
         assert!(contextual.contains(r#""matched_word":"acme""#));
         assert!(empty.contains(r#""guesses_log10":0.0"#));
 
-        println!("=== WEAK DTO ===\n{weak}");
-        println!("=== STRONG DTO ===\n{strong}");
-        println!("=== CONTEXTUAL DTO ===\n{contextual}");
-        println!("=== EMPTY DTO ===\n{empty}");
+        println!("=== ABC123 ===\n{abc}");
+        println!("=== WOMBAT ===\n{wombat}");
     }
 
     #[test]
-    fn rejects_oversized_and_invalid_utf8_and_null_free_is_safe() {
-        let oversized = vec![b'a'; MAX_PASSWORD_BYTES + 1];
-        assert!(eval_ffi(&oversized, None).is_none());
+    fn handles_nul_bytes_control_chars_l33t_and_unicode_without_panic() {
+        let embedded_nul = eval_ffi(b"abc\0123", Some(b"user\0input")).unwrap();
+        assert!(embedded_nul.contains(r"\u0000"), "{embedded_nul}");
 
-        let invalid_utf8 = [0xff, 0xfe, 0xfd];
-        assert!(eval_ffi(&invalid_utf8, None).is_none());
+        let only_nuls = eval_ffi(b"\0\0\0", None).unwrap();
+        assert!(only_nuls.contains(r#""score":0"#), "{only_nuls}");
 
+        // All ASCII control characters 0x00..=0x1F + 0x7F
+        let mut all_controls: Vec<u8> = (0u8..=0x1F).collect();
+        all_controls.push(0x7F);
+        let controls_res = eval_ffi(&all_controls, None).unwrap();
+        assert!(controls_res.contains(r#""sequence":"#));
+
+        // Heavy l33t table exercise & newlines inside password
+        let l33t_heavy = eval_ffi(b"@48(3691!|0$5+7%2\n\r\np@ssw0rd", None).unwrap();
+        assert!(l33t_heavy.contains(r#""score":"#));
+
+        // JSON injection attempt inside password and user_inputs
+        let json_inj = eval_ffi(
+            br#"{"score":4,"guesses":1}\""#,
+            Some(br#"{"warning":"fake"}"#),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_inj).unwrap();
+        assert!(parsed["score"].as_u64().is_some());
+
+        // Long 40-token password up to MAX_PASSWORD_BYTES
+        let max_valid = vec![b'x'; MAX_PASSWORD_BYTES];
+        assert!(eval_ffi(&max_valid, None).is_some());
+
+        let max_inputs = vec![b'u'; MAX_INPUTS_BYTES];
+        assert!(eval_ffi(b"test-password-check", Some(&max_inputs)).is_some());
+    }
+
+    #[test]
+    fn validates_null_pointers_length_caps_and_malformed_utf8() {
+        // Null password pointer with 0 length is accepted as empty string
+        assert!(eval_ffi_raw(ptr::null(), 0, ptr::null(), 0).is_some());
+
+        // Null pointer paired with non-zero length MUST be rejected safely
+        assert!(eval_ffi_raw(ptr::null(), 1, ptr::null(), 0).is_none());
+        assert!(eval_ffi_raw(b"abc".as_ptr(), 3, ptr::null(), 4).is_none());
+
+        // Exceeding byte caps
+        let oversized_pwd = vec![b'a'; MAX_PASSWORD_BYTES + 1];
+        assert!(eval_ffi(&oversized_pwd, None).is_none());
+        let oversized_inputs = vec![b'b'; MAX_INPUTS_BYTES + 1];
+        assert!(eval_ffi(b"valid-password", Some(&oversized_inputs)).is_none());
+
+        // Malformed UTF-8 sequences in both password and user_inputs
+        let bad_utf8_cases: &[&[u8]] = &[
+            &[0x80],                   // lone continuation byte
+            &[0xC0, 0xAF],             // overlong slash
+            &[0xE2, 0x82],             // truncated 3-byte char
+            &[0xF0, 0x9F, 0x9A],       // truncated 4-byte emoji
+            &[0xFF, 0xFE, 0xFD],       // invalid prefix bytes
+        ];
+        for bad in bad_utf8_cases {
+            assert!(eval_ffi(bad, None).is_none());
+            assert!(eval_ffi(b"valid-password", Some(bad)).is_none());
+        }
+
+        // Null pointer passed to free is a no-op
         unsafe { zxcvbn_free_string(ptr::null_mut()) };
+    }
+
+    #[test]
+    fn catch_unwind_contains_panics_across_ffi_boundary() {
+        extern "C" fn panicking_ffi_guard() -> *mut c_char {
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| -> Option<*mut c_char> {
+                panic!("simulated internal panic");
+            }));
+            match outcome {
+                Ok(Some(ptr)) => ptr,
+                _ => ptr::null_mut(),
+            }
+        }
+
+        assert!(panicking_ffi_guard().is_null());
     }
 }
