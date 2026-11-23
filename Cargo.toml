@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = [
+    "rust_crates/zxcvbn_ffi",
+    "rust_crates/xtask",
+]

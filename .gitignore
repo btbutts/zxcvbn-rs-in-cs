@@ -1,0 +1,6 @@
+/target/
+/runtimes/
+/artifacts/
+**/bin/
+**/obj/
+.DS_Store
